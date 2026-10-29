@@ -13,6 +13,73 @@ The package isn't on Packagist, so a plugin adds the repository and then require
 
 It needs PHP 8.3 or later, because Pest 4 does.
 
+## Make targets
+
+The targets that plugins share are in `make/plugin.mk`. A plugin's `Makefile` sets its variables, defines its own `docker-check` and `test:install` targets, and then includes the file. The plugin has to define those two targets itself, because `plugin.mk` doesn't exist until `test:install` has run Composer.
+
+```make
+PLUGIN := my-plugin
+TEST_DIR := tests
+WP_ENV_PORT := 8888
+MULTISITE_PORT := 8889
+MULTISITE_TITLE := My Plugin Network
+TEST_JS = npm run test:js
+
+TOOLING_MK := vendor/pryley/wp-plugin-tooling/make/plugin.mk
+ifneq ($(wildcard $(TOOLING_MK)),)
+include $(TOOLING_MK)
+else
+.DEFAULT:
+	@printf '\nRun `make test:install` first.\n\n'
+endif
+
+.PHONY: docker-check
+docker-check:
+	@docker info >/dev/null 2>&1 || { printf '\nThe Docker engine is not running.\n\n'; exit 1; }
+
+.PHONY: test\:install
+test\:install: docker-check ## Start wp-env and install the composer dev dependencies inside it
+	@test ! -d vendor/pryley/wp-plugin-tooling/.git || test -z "$$(git -C vendor/pryley/wp-plugin-tooling status --porcelain)" || { \
+		printf '\nvendor/pryley/wp-plugin-tooling has uncommitted changes. Commit or discard them first.\n\n'; exit 1; }
+	rm -rf vendor
+	WP_ENV_PORT=$(WP_ENV_PORT) npx @wordpress/env start
+	npx @wordpress/env run cli --env-cwd=wp-content/plugins/$(PLUGIN) composer install
+```
+
+Run `make help` to see every target. It lists the shared targets and the plugin's own targets together. The shared targets run the Composer scripts `test`, `test:unit`, `test:integration`, `test:thirdparty`, `test:import` and `test:coverage`, so the plugin needs to define those scripts.
+
+A plugin can set these variables before the include:
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `PLUGIN` | The folder's name | The plugin's slug, which is also the name of its main file. |
+| `TEST_DIR` | `tests` | The folder that holds the Pest tests. |
+| `SUITES` | `Unit Integration ThirdParty Import` | The suites that `make test:random` shuffles. Set `RANDOM_SUITES` to change only that list. |
+| `WP_ENV_PORT` | `8888` | The port of the main wp-env instance. |
+| `MULTISITE_DIR` | `tests/multisite` | The folder that holds the multisite suite and its wp-env config. |
+| `MULTISITE_PORT` | `8889` | The port of the multisite wp-env instance. |
+| `MULTISITE_TITLE` | `$(PLUGIN) Network` | The title of the test network. |
+| `WPENV_CONFIGS` | `.wp-env.json` and the multisite config | The wp-env configs that `make env:update` pins to the latest WordPress. |
+| `COVERAGE_CLOVERS` | `tests/coverage/clover.xml tests/coverage/multisite.xml` | The coverage files that `make coverage:merge` merges. |
+| `COVERAGE_SOURCE` | `plugin` | The folder whose changes make `make coverage:merge` warn that a coverage file is out of date. |
+| `I18N_DOMAIN` | `$(PLUGIN)` | The text domain. |
+| `I18N_EXCLUDE` | `node_modules,tests,vendor` | The folders that make-pot skips. |
+| `I18N_HEADERS` | `{}` | The headers of the .pot file, written as JSON. |
+
+To add a step to a shared target, a plugin sets one of these hook variables to the commands it wants to run:
+
+| Hook | When it runs |
+|---|---|
+| `TEST_JS` | Before the Pest suites in `make test`. |
+| `TEST_ALL_EXTRA` | At the end of `make test:all`. Set it to the extra suite targets to run. |
+| `COVERAGE_ALL_EXTRA` | In `make coverage:all`, before the merge. Set it to the extra coverage targets to run. |
+| `ENV_UPDATE_AFTER` | After `make env:update` has updated the instances. |
+| `I18N_AFTER` | After `make build:i18n` has built the .mo files. |
+| `MULTISITE_PREPARE` | Before the multisite instance starts. |
+| `MULTISITE_SETUP` | After the network is configured, in the multisite folder. Write `quietly <command>` to print a command's output only when it fails. |
+
+Every target works with GNU Make 3.81, which is the version that macOS ships.
+
 ## The Pest harness
 
 `Pryley\WpPluginTooling\Pest\Isolation` runs each test inside a database transaction and restores the hooks and the request afterwards. It fails a test that commits the transaction without saying so, and a test that defines `WP_IMPORTING` without saying so. The plugin passes in the steps that only it knows about:
@@ -34,7 +101,7 @@ The helper functions in `src/Pest/functions.php` use the same namespace. A suite
 
 ## Stubs
 
-`bin/generate-stubs` builds a plugin's third-party stubs, which phpstan and the test suite load in place of the real plugins. It reads the plugin's manifest in `tests/bin/stubs-manifest.php` and writes the stubs to `tests/stubs`. Run it from the plugin's root as `php vendor/pryley/wp-plugin-tooling/bin/generate-stubs`. Name some slugs to regenerate only those stubs, or add `--list` to show the manifest instead. The comment at the top of the script describes the options a manifest entry can use.
+`bin/generate-stubs` builds a plugin's third-party stubs, which phpstan and the test suite load in place of the real plugins. It reads the plugin's manifest in `tests/bin/stubs-manifest.php` and writes the stubs to `tests/stubs`. Run `make stubs` to list the manifest, and `make stubs:update` to regenerate the stubs. Add `SLUGS='woocommerce'` to regenerate only some of them. The comment at the top of the script describes the options a manifest entry can use.
 
 The generator never overwrites a file in `tests/stubs` that doesn't carry its header. That way a hand-written file, such as a working fake, is safe.
 
@@ -62,6 +129,8 @@ A plugin's `phpcs.xml` references the shared ruleset and sets everything else it
 <config name="testVersion" value="8.1-"/>
 ```
 
+`make compat` checks PHP compatibility with PHP_CodeSniffer and WordPress compatibility with wp-since, and `make build:i18n` checks the plugin's text domains with its `phpcs-i18n.xml` and WordPressCS. Each tool is installed inside the package's folder the first time a target runs it.
+
 ## Releases
 
 `bin/release-check` runs the checks before a release. It stops if anything is uncommitted or if the main file's Version doesn't match the Stable tag in readme.txt. Then it asks you to confirm each item on a checklist. A plugin's release script builds the plugin, runs the check, and then deploys:
@@ -73,7 +142,11 @@ php vendor/pryley/wp-plugin-tooling/bin/release-check --ask="Updated the What's 
 
 Each `--ask` adds one item of the plugin's own to the end of the checklist.
 
-`bin/bump` changes the version in composer.json, readme.txt and the main plugin file. Run it from the plugin's root as `php vendor/pryley/wp-plugin-tooling/bin/bump`. It makes a patch release by default. Name `minor`, `major` or `beta` for another kind, and add `--dry-run` to preview the change.
+`make bump` changes the version in composer.json, readme.txt and the main plugin file. It makes a patch release by default. Use `TYPE=minor`, `TYPE=major` or `TYPE=beta` for another kind, and `DRY=1` to preview the change.
+
+## Changing the package from a plugin
+
+Run `make tooling:source` in the plugin to replace the installed release with a git clone of this repository on `main`. You can then change the package and test it with the plugin. When you're done, commit, tag and push from `vendor/pryley/wp-plugin-tooling`, then run `composer update pryley/wp-plugin-tooling` in the plugin and commit its lock file. `make tooling:dist` puts the released version back. Both targets run on your computer rather than in wp-env, because the wp-env container doesn't have git.
 
 ## Versions
 

@@ -8,6 +8,7 @@
 - Added `bin/release-check`, the checks and checklist before a release
 - Added `i18n/schema.php`, which lets make-pot read WordPress's i18n schemas from the install
 - Added `Isolation`, the per-test isolation of a plugin's Pest suite, with the mailbox, HTTP and hook helpers
+- Added `make/plugin.mk`, the make targets a WordPress plugin shares
 - Added `phpstan/base.neon`, the phpstan settings a plugin starts from
 - Added `rulesets/compat.xml`, PHPCompatibility aware of what WordPress provides
 - Added `tools/`, the isolated PHP_CodeSniffer, WordPressCS and wp-since installs
