@@ -1,0 +1,9 @@
+includes:
+    - phpstan/base.neon
+parameters:
+    paths:
+        - bin/bump
+        - bin/generate-stubs
+        - bin/merge-clover
+        - bin/release-check
+        - src

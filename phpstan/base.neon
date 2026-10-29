@@ -1,0 +1,16 @@
+# The phpstan settings a WordPress plugin starts from. A plugin's phpstan.neon includes this
+# file and then adds its paths, stubs and ignores.
+includes:
+    - phar://phpstan.phar/conf/bleedingEdge.neon
+    - %rootDir%/../../szepeviktor/phpstan-wordpress/extension.neon
+parameters:
+    bootstrapFiles:
+        - bootstrap.php
+    ignoreErrors:
+        # Mostly "sealed array shape" complaints about arrays built at runtime and passed to WordPress
+        -
+            identifier: argument.type
+            reportUnmatched: false
+    level: 5
+    reportUnmatchedIgnoredErrors: true
+    treatPhpDocTypesAsCertain: false

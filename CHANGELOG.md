@@ -7,3 +7,4 @@
 - Added `bin/merge-clover`, which merges coverage files and prints the merged table
 - Added `bin/release-check`, the checks and checklist before a release
 - Added `Isolation`, the per-test isolation of a plugin's Pest suite, with the mailbox, HTTP and hook helpers
+- Added `phpstan/base.neon`, the phpstan settings a plugin starts from

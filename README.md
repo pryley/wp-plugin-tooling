@@ -40,6 +40,17 @@ The generator never overwrites a file in `tests/stubs` that doesn't carry its he
 
 phpstan has to load the stubs as `bootstrapFiles`, because a plugin class that extends a stub's class can't load until the stub has run. So a plugin's phpstan config should load only one stub for each third-party plugin. If a symbol is declared twice, PHP stops with an error that names both files.
 
+## phpstan
+
+A plugin's `phpstan.neon` includes the base config and then adds its own paths, stubs and ignores:
+
+```neon
+includes:
+    - vendor/pryley/wp-plugin-tooling/phpstan/base.neon
+```
+
+The base config sets level 5 and `treatPhpDocTypesAsCertain: false`. It also loads bleedingEdge, the WordPress extension (`szepeviktor/phpstan-wordpress`) and the WordPress constants that phpstan needs, and it ignores `argument.type` errors.
+
 ## Releases
 
 `bin/release-check` runs the checks before a release. It stops if anything is uncommitted or if the main file's Version doesn't match the Stable tag in readme.txt. Then it asks you to confirm each item on a checklist. A plugin's release script builds the plugin, runs the check, and then deploys:
