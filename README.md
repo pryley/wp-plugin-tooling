@@ -51,6 +51,10 @@ includes:
 
 The base config sets level 5 and `treatPhpDocTypesAsCertain: false`. It also loads bleedingEdge, the WordPress extension (`szepeviktor/phpstan-wordpress`) and the WordPress constants that phpstan needs, and it ignores `argument.type` errors.
 
+## phpcs
+
+PHP_CodeSniffer with PHPCompatibility, WordPressCS and wp-since each have their own installation in `tools/`. They can't share the plugin's `vendor/` folder: WordPressCS needs PHP_CodeSniffer 3, while PHPCompatibility runs on version 4, and wp-since needs version 4 of `nikic/php-parser`, while Pest needs version 5.
+
 ## Releases
 
 `bin/release-check` runs the checks before a release. It stops if anything is uncommitted or if the main file's Version doesn't match the Stable tag in readme.txt. Then it asks you to confirm each item on a checklist. A plugin's release script builds the plugin, runs the check, and then deploys:

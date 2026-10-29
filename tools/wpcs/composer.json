@@ -1,0 +1,17 @@
+{
+    "name": "pryley/wp-plugin-tooling-wpcs",
+    "description": "WordPressCS on its own PHP_CodeSniffer 3 toolchain: the phpcs project runs PHP_CodeSniffer 4, which WordPressCS does not support yet.",
+    "type": "project",
+    "license": "MIT",
+    "config": {
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        },
+        "preferred-install": "dist",
+        "lock": false
+    },
+    "require-dev": {
+        "dealerdirect/phpcodesniffer-composer-installer": "^1.0",
+        "wp-coding-standards/wpcs": "^3.2"
+    }
+}

@@ -1,0 +1,14 @@
+{
+    "name": "pryley/wp-plugin-tooling-wp-since",
+    "description": "The wp-since WordPress-compatibility checker, installed on its own: it pins nikic/php-parser ^4 while Pest 4 needs ^5, so the two cannot share a plugin's vendor folder.",
+    "type": "project",
+    "license": "MIT",
+    "config": {
+        "preferred-install": "dist"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require-dev": {
+        "eduardovillao/wp-since": "^1.1"
+    }
+}
