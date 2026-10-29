@@ -1,0 +1,194 @@
+#!/usr/bin/env php
+<?php
+
+/*
+ * A command that merges clover coverage files into one and prints the merged table.
+ * A line counts as covered when any input covers it.
+ *
+ *     merge-clover <in.xml>... <out.xml>
+ *
+ * `make coverage:merge` runs it to add the other suites' coverage, such as
+ * tests/coverage/multisite.xml, to the main run's tests/coverage/clover.xml.
+ * Pest's console report shows only the run it made.
+ *
+ * Every input has to come from the same code. A clover made before a change has the old
+ * line numbers, and merging it reports uncovered lines that don't exist. Regenerate them
+ * all after changing the plugin's code.
+ */
+
+$args = array_slice($_SERVER['argv'] ?? [], 1);
+if (count($args) < 2) {
+    fwrite(STDERR, "Usage: merge-clover <in.xml>... <out.xml>\n");
+    exit(1);
+}
+$output = array_pop($args);
+
+$files = []; // name => ['lines' => [num => ['count' => int, 'type' => string]]]
+foreach ($args as $clover) {
+    if (!file_exists($clover)) {
+        fwrite(STDERR, "Skipping missing clover file: {$clover}\n");
+        continue;
+    }
+    $xml = simplexml_load_file($clover);
+    if (false === $xml) {
+        fwrite(STDERR, "Cannot parse: {$clover}\n");
+        exit(1);
+    }
+    foreach ($xml->xpath('//file') as $file) {
+        // The plugin has the same path in every wp-env instance, so a file's name matches across inputs.
+        $name = (string) $file['name'];
+        foreach ($file->line as $line) {
+            $num = (int) $line['num'];
+            $count = (int) $line['count'];
+            $type = (string) $line['type'];
+            $known = $files[$name]['lines'][$num]['count'] ?? -1;
+            if ($count > $known) {
+                $files[$name]['lines'][$num] = ['count' => $count, 'type' => $type ?: 'stmt'];
+            }
+        }
+    }
+}
+if (empty($files)) {
+    fwrite(STDERR, "Nothing to merge.\n");
+    exit(1);
+}
+
+ksort($files);
+$dom = new DOMDocument('1.0', 'UTF-8');
+$dom->formatOutput = true;
+$coverage = $dom->createElement('coverage');
+$coverage->setAttribute('generated', (string) time());
+$dom->appendChild($coverage);
+$project = $dom->createElement('project');
+$project->setAttribute('timestamp', (string) time());
+$coverage->appendChild($project);
+
+$totalStatements = 0;
+$totalCovered = 0;
+foreach ($files as $name => $data) {
+    $fileEl = $dom->createElement('file');
+    $fileEl->setAttribute('name', $name);
+    ksort($data['lines']);
+    $statements = 0;
+    $covered = 0;
+    foreach ($data['lines'] as $num => $line) {
+        $lineEl = $dom->createElement('line');
+        $lineEl->setAttribute('num', (string) $num);
+        $lineEl->setAttribute('type', $line['type']);
+        $lineEl->setAttribute('count', (string) $line['count']);
+        $fileEl->appendChild($lineEl);
+        if ('stmt' === $line['type']) {
+            ++$statements;
+            if ($line['count'] > 0) {
+                ++$covered;
+            }
+        }
+    }
+    $metrics = $dom->createElement('metrics');
+    $metrics->setAttribute('statements', (string) $statements);
+    $metrics->setAttribute('coveredstatements', (string) $covered);
+    $fileEl->appendChild($metrics);
+    $project->appendChild($fileEl);
+    $totalStatements += $statements;
+    $totalCovered += $covered;
+}
+$metrics = $dom->createElement('metrics');
+$metrics->setAttribute('statements', (string) $totalStatements);
+$metrics->setAttribute('coveredstatements', (string) $totalCovered);
+$project->appendChild($metrics);
+
+$dom->save($output);
+
+// The merged table follows Pest's coverage report: a row per file, its uncovered lines and its percentage.
+// It is always coloured because plugin.mk runs Pest with --colors=always.
+
+function ansi(string $code, string $text): string
+{
+    return "\033[{$code}m{$text}\033[39m";
+}
+
+/**
+ * Join consecutive line numbers into ranges: [44, 45, 46, 50] becomes "44..46, 50".
+ *
+ * @param int[] $lines
+ */
+function formatRanges(array $lines): string
+{
+    $ranges = [];
+    $start = $end = null;
+    foreach ($lines as $num) {
+        if (null !== $end && $num === $end + 1) {
+            $end = $num;
+            continue;
+        }
+        if (null !== $start) {
+            $ranges[] = $start === $end ? (string) $start : "{$start}..{$end}";
+        }
+        $start = $end = $num;
+    }
+    if (null !== $start) {
+        $ranges[] = $start === $end ? (string) $start : "{$start}..{$end}";
+    }
+    return implode(', ', $ranges);
+}
+
+/**
+ * Return the folder every file name starts with.
+ *
+ * @param string[] $names
+ */
+function sharedFolder(array $names): string
+{
+    $shared = dirname((string) reset($names)).'/';
+    foreach ($names as $name) {
+        while ('/' !== $shared && !str_starts_with($name, $shared)) {
+            $parent = dirname(rtrim($shared, '/'));
+            $shared = '/' === $parent ? '/' : "{$parent}/";
+        }
+    }
+    return $shared;
+}
+
+$shared = sharedFolder(array_keys($files));
+$width = 78;
+echo "\nMerged coverage (covered in any suite counts):\n\n";
+foreach ($files as $name => $data) {
+    $statements = 0;
+    $covered = 0;
+    $uncovered = [];
+    ksort($data['lines']); // the writer loop sorted a by-value copy, not this one
+    foreach ($data['lines'] as $num => $line) {
+        if ('stmt' !== $line['type']) {
+            continue;
+        }
+        ++$statements;
+        if ($line['count'] > 0) {
+            ++$covered;
+        } else {
+            $uncovered[] = $num;
+        }
+    }
+    $label = substr($name, strlen($shared));
+    $label = preg_replace('/\.php$/', '', $label);
+    $pct = $statements ? 100 * $covered / $statements : 100;
+    if (empty($uncovered)) {
+        $plain = sprintf('%.1f%%', $pct);
+        $right = ansi('32', $plain);
+    } else {
+        $ranges = formatRanges($uncovered);
+        $plain = sprintf('%s / %.1f%%', $ranges, $pct);
+        $right = ansi('33', $ranges).' '.ansi('90', '/').ansi('33', sprintf(' %.1f%%', $pct));
+    }
+    $dots = max(1, $width - strlen($label) - strlen($plain) - 2);
+    printf("  %s %s %s\n", $label, ansi('90', str_repeat('.', $dots)), $right);
+}
+$total = sprintf('Total: %.1f %%', $totalStatements ? 100 * $totalCovered / $totalStatements : 0);
+printf(
+    "%s\n%s\n\nMerged %d file(s) into %s (%d/%d statements)\n",
+    ansi('90', str_repeat('─', $width + 4)),
+    str_pad('', max(0, $width + 2 - strlen($total)))."\033[1m{$total}\033[22m",
+    count($files),
+    $output,
+    $totalCovered,
+    $totalStatements
+);

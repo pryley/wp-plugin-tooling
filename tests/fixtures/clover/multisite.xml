@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1">
+  <project timestamp="1">
+    <file name="/var/www/html/wp-content/plugins/example/plugin/Alpha.php">
+      <line num="3" type="stmt" count="2"/>
+      <line num="4" type="stmt" count="0"/>
+    </file>
+  </project>
+</coverage>
