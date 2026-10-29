@@ -1,0 +1,96 @@
+#!/usr/bin/env php
+<?php
+
+/*
+ * A command that runs the checks before a plugin is released: nothing uncommitted, the header's
+ * Version matching readme.txt's Stable tag, then a checklist confirmed one item at a time.
+ * Run it from the plugin's root after building and before deploying.
+ *
+ *     release-check [--plugin-file=my-plugin.php] [--ask="Updated the What's New page?"]...
+ *
+ * The main plugin file defaults to the folder's name with .php, as WordPress names it.
+ * Each --ask adds an item after the shared ones. It exits non-zero when a check fails,
+ * so a release script run with `set -e` stops there.
+ */
+
+$root = (string) getcwd();
+$pluginFile = basename($root).'.php';
+$asks = [];
+foreach (array_slice($_SERVER['argv'] ?? [], 1) as $arg) {
+    if (str_starts_with($arg, '--plugin-file=')) {
+        $pluginFile = substr($arg, strlen('--plugin-file='));
+    } elseif (str_starts_with($arg, '--ask=')) {
+        $asks[] = substr($arg, strlen('--ask='));
+    }
+}
+
+function fail(string $message): never
+{
+    fwrite(STDERR, "\n❌ \033[0;31m{$message}\033[0m\n\n");
+    exit(1);
+}
+
+function readHeader(string $contents, string $name): string
+{
+    return preg_match('/^[\s*#@]*'.preg_quote($name, '/').':\s*(.+?)\s*$/mi', $contents, $matches)
+        ? $matches[1]
+        : '';
+}
+
+foreach ([$pluginFile, 'readme.txt'] as $file) {
+    if (!is_file("{$root}/{$file}")) {
+        fail("No {$file} in {$root}.");
+    }
+}
+$plugin = (string) file_get_contents("{$root}/{$pluginFile}");
+$readme = (string) file_get_contents("{$root}/readme.txt");
+$version = readHeader($plugin, 'Version');
+$stable = readHeader($readme, 'Stable tag');
+$requiresPhp = readHeader($plugin, 'Requires PHP');
+$requiresWp = readHeader($plugin, 'Requires at least');
+$testedUpTo = readHeader($readme, 'Tested up to');
+$releaseDate = preg_match('/^= '.preg_quote($version, '/').' \((\d{4}-\d{2}-\d{2})\) =/m', $readme, $matches)
+    ? $matches[1]
+    : 'none found';
+
+exec('git status --porcelain=v2 2>/dev/null', $changes, $status);
+if (0 !== $status) {
+    fail('This is not a git repository.');
+}
+if (!empty($changes)) {
+    fail('You forgot to commit changes.');
+}
+
+echo "--------------------------------------------\n";
+echo "Plugin version: {$version}\n";
+echo "Stable version: {$stable}\n";
+echo "--------------------------------------------\n\n";
+if ($version !== $stable && 'trunk' !== $stable) {
+    fail('Version mismatch.');
+}
+
+$checklist = [ // order is intentional: the files to update, then what to verify
+    "Updated the 'Minimum plugin requirements' in readme.txt?",
+    "Updated the 'Requires at least: {$requiresWp}' in {$pluginFile}?",
+    "Updated the 'Requires PHP: {$requiresPhp}' in {$pluginFile}?",
+    "Updated the 'Tested up to: {$testedUpTo}' in readme.txt?",
+];
+if (is_file("{$root}/wpml-config.xml")) {
+    $checklist[] = 'Updated wpml-config.xml?';
+}
+array_push($checklist,
+    'Updated the screenshots?',
+    "Verified compatibility with PHP v{$requiresPhp} -> latest?",
+    "Verified compatibility with WordPress v{$requiresWp} -> latest?",
+    "Verified the changelog release date ({$releaseDate})?",
+    'Passed phpstan and the tests?',
+    ...$asks
+);
+
+echo "Before continuing, confirm that you have done the following:\n\n";
+foreach ($checklist as $item) {
+    echo " - {$item}";
+    fgets(STDIN);
+}
+echo "\nPRESS [ENTER] TO BEGIN RELEASING {$version}";
+fgets(STDIN);

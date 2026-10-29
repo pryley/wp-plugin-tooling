@@ -23,6 +23,15 @@ phpstan has to load the stubs as `bootstrapFiles`, because a plugin class that e
 
 ## Releases
 
+`bin/release-check` runs the checks before a release. It stops if anything is uncommitted or if the main file's Version doesn't match the Stable tag in readme.txt. Then it asks you to confirm each item on a checklist. A plugin's release script builds the plugin, runs the check, and then deploys:
+
+```sh
+make build
+php vendor/pryley/wp-plugin-tooling/bin/release-check --ask="Updated the What's New page?"
+```
+
+Each `--ask` adds one item of the plugin's own to the end of the checklist.
+
 `bin/bump` changes the version in composer.json, readme.txt and the main plugin file. Run it from the plugin's root as `php vendor/pryley/wp-plugin-tooling/bin/bump`. It makes a patch release by default. Name `minor`, `major` or `beta` for another kind, and add `--dry-run` to preview the change.
 
 ## Versions
