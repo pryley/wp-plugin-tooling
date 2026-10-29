@@ -8,4 +8,5 @@
 - Added `bin/release-check`, the checks and checklist before a release
 - Added `Isolation`, the per-test isolation of a plugin's Pest suite, with the mailbox, HTTP and hook helpers
 - Added `phpstan/base.neon`, the phpstan settings a plugin starts from
+- Added `rulesets/compat.xml`, PHPCompatibility aware of what WordPress provides
 - Added `tools/`, the isolated PHP_CodeSniffer, WordPressCS and wp-since installs

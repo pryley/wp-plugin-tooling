@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<ruleset name="WordPress plugin PHP compatibility" namespace="Pryley\WpPluginTooling">
+    <description>PHPCompatibility, aware of what WordPress provides: the str_* functions it has polyfilled since 5.9, and attributes, which older PHP reads as comments. A plugin's phpcs.xml references this ruleset and sets its own testVersion, arguments and files.</description>
+    <rule ref="PHPCompatibility">
+        <!-- PHP 8.6 adds the form feed to trim()'s default characters, which only matters to code that trims form feeds. -->
+        <exclude name="PHPCompatibility.ParameterValues.NewTrimCharactersDefault"/>
+    </rule>
+    <rule ref="PHPCompatibility.Attributes.NewAttributes.Found">
+        <severity>0</severity>
+    </rule>
+    <rule ref="PHPCompatibility.FunctionUse.NewFunctions.str_containsFound">
+        <severity>0</severity>
+    </rule>
+    <rule ref="PHPCompatibility.FunctionUse.NewFunctions.str_ends_withFound">
+        <severity>0</severity>
+    </rule>
+    <rule ref="PHPCompatibility.FunctionUse.NewFunctions.str_starts_withFound">
+        <severity>0</severity>
+    </rule>
+</ruleset>
