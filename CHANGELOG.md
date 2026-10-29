@@ -6,3 +6,4 @@
 - Added `bin/generate-stubs`, which generates a plugin's third-party stubs from its manifest
 - Added `bin/merge-clover`, which merges coverage files and prints the merged table
 - Added `bin/release-check`, the checks and checklist before a release
+- Added `Isolation`, the per-test isolation of a plugin's Pest suite, with the mailbox, HTTP and hook helpers

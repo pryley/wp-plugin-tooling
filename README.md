@@ -13,6 +13,25 @@ The package isn't on Packagist, so a plugin adds the repository and then require
 
 It needs PHP 8.3 or later, because Pest 4 does.
 
+## The Pest harness
+
+`Pryley\WpPluginTooling\Pest\Isolation` runs each test inside a database transaction and restores the hooks and the request afterwards. It fails a test that commits the transaction without saying so, and a test that defines `WP_IMPORTING` without saying so. The plugin passes in the steps that only it knows about:
+
+```php
+use Pryley\WpPluginTooling\Pest\Isolation;
+
+$isolation = new Isolation(
+    prelude: fn () => MyCache::flush(),        // runs first in beforeEach, outside the transaction
+    reset: fn () => resetGlobalState(),        // runs in afterEach, after the object cache is flushed
+    purge: fn () => purgeCommittedRows(),      // runs after a test that declared its commit
+);
+uses()->beforeEach($isolation->beforeEach())->afterEach($isolation->afterEach())->in('Unit', 'Integration');
+```
+
+A test that runs DDL must call `commitsTransaction()`. After that test, Isolation commits what it wrote last, which is usually its own cleanup, and then runs the purge. The test fails if it changed the number of rows in the posts table, the terms table, or the options table (not counting transients). An import suite should be declared last in `phpunit.xml` and call `definesWpImporting()` in its `beforeEach`.
+
+The helper functions in `src/Pest/functions.php` use the same namespace. A suite's bootstrap calls `interceptMail()` and `blockHttpRequests()` once. Tests can then use `sentMail()`, `sentTo()`, `interceptHttp()` and `sentJson()`. The harness itself uses `backupHooks()`, `restoreHooks()` and `resetRequestState()`.
+
 ## Stubs
 
 `bin/generate-stubs` builds a plugin's third-party stubs, which phpstan and the test suite load in place of the real plugins. It reads the plugin's manifest in `tests/bin/stubs-manifest.php` and writes the stubs to `tests/stubs`. Run it from the plugin's root as `php vendor/pryley/wp-plugin-tooling/bin/generate-stubs`. Name some slugs to regenerate only those stubs, or add `--list` to show the manifest instead. The comment at the top of the script describes the options a manifest entry can use.

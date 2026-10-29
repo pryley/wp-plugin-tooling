@@ -17,6 +17,14 @@
     "require-dev": {
         "pestphp/pest": "^4.0"
     },
+    "autoload": {
+        "psr-4": {
+            "Pryley\\WpPluginTooling\\": "src/"
+        },
+        "files": [
+            "src/Pest/functions.php"
+        ]
+    },
     "autoload-dev": {
         "psr-4": {
             "Pryley\\WpPluginTooling\\Tests\\": "tests/"
