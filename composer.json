@@ -1,0 +1,40 @@
+{
+    "name": "pryley/wp-plugin-tooling",
+    "description": "Development tooling for WordPress plugins: Makefile targets for wp-env, a Pest isolation harness, a third-party stub generator, phpstan and phpcs bases, and release checks.",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Paul Ryley",
+            "email": "paul@geminilabs.io"
+        }
+    ],
+    "require": {
+        "php": ">=8.3",
+        "php-stubs/generator": "^0.9",
+        "php-stubs/wordpress-stubs": "^6.0 || ^7.0"
+    },
+    "require-dev": {
+        "pestphp/pest": "^4.0"
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Pryley\\WpPluginTooling\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        },
+        "preferred-install": "dist",
+        "sort-packages": true
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "1.x-dev"
+        }
+    },
+    "scripts": {
+        "test": "pest"
+    }
+}

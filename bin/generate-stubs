@@ -1,0 +1,1050 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * A command that generates a plugin's third-party stubs from its manifest. Run it from the plugin's root.
+ *
+ * Usage:
+ *   generate-stubs                    regenerate every entry whose source is available
+ *   generate-stubs woocommerce elementor
+ *   generate-stubs --list             show the manifest and each source's availability
+ *   generate-stubs --manifest=tests/bin/stubs-manifest.php --out=tests/stubs
+ *
+ * The manifest defaults to tests/bin/stubs-manifest.php and the stubs to tests/stubs. Sources,
+ * append fragments, --manifest and --out resolve from the directory the command runs in. The
+ * load order is read from the stub-load-order.php beside the manifest when there is one.
+ *
+ * The manifest returns one entry per stub, keyed by the stub's slug (tests/stubs/<slug>.php).
+ * An entry's options:
+ *
+ *   source    Where the plugin or theme source comes from. A string, or an array of strings to
+ *             merge several sources into one stub:
+ *               - "https://…/foo.zip"        a remote zip. For wordpress.org use
+ *                                            /plugin/<slug>.latest-stable.zip, because the bare
+ *                                            <slug>.zip serves trunk, which can be a beta
+ *               - "github:owner/repo"        the source zipball of the latest GitHub release tag
+ *               - "tests/bin/zips/foo.zip"   a local zip, for a plugin that isn't free to download.
+ *                                            The entry is skipped with a notice while it is absent
+ *               - "vendors/foo"              a local folder
+ *
+ *   symbols   An optional allowlist. With it, the stub keeps only these classes, interfaces,
+ *             traits, functions and constants (fully qualified, case-insensitive), plus every
+ *             parent a kept class needs. Without it, the whole source is stubbed, minus `exclude`.
+ *             The list is what the plugin calls of the third party, so a new call means a new
+ *             symbol here and a rerun.
+ *
+ *   exclude   Folders, or single files when an entry ends in ".php", removed from the source
+ *             before generation. It replaces the default list: build, dist, node_modules, test,
+ *             Test, tests, Tests, vendor, vendors. A bare name matches at any depth, and a name
+ *             with a slash matches that relative path at any depth. Case-sensitive.
+ *
+ *   append    A hand-written fragment (such as tests/bin/fragments/<slug>.php) added to the end of
+ *             the stub, for symbols the generator cannot reach, such as a class declared inside a
+ *             function. Keep its namespaces braced.
+ *
+ * A file in the stubs folder that does not carry the generator's header is hand-written, such as
+ * a working fake, and is never overwritten.
+ *
+ * A local zip that is absent is an error when its slug is named on the command line.
+ *
+ * After writing, every file in the stubs folder is scanned, the hand-written fakes included.
+ * It warns about a symbol declared in more than one stub, and it fails on a class that extends
+ * a class from another stub when stub-load-order.php doesn't load that stub first.
+ */
+
+use PhpParser\Node;
+use PhpParser\Node\Expr\FuncCall;
+use PhpParser\Node\Name;
+use PhpParser\Node\Scalar\String_;
+use PhpParser\Node\Stmt;
+use PhpParser\PrettyPrinter\Standard;
+use StubsGenerator\Finder;
+use StubsGenerator\StubsGenerator;
+
+error_reporting(E_ALL);
+
+$args = array_slice($_SERVER['argv'] ?? [], 1);
+$option = function (string $name) use ($args): string {
+    foreach ($args as $arg) {
+        if (str_starts_with($arg, "--{$name}=")) {
+            return substr($arg, strlen("--{$name}="));
+        }
+    }
+    return '';
+};
+
+define('PROJECT_ROOT', (string) getcwd());
+$fromProject = fn (string $path): string => str_starts_with($path, '/') ? $path : PROJECT_ROOT.'/'.$path;
+define('MANIFEST', $fromProject($option('manifest') ?: 'tests/bin/stubs-manifest.php'));
+define('STUBS_DIR', $fromProject($option('out') ?: 'tests/stubs'));
+define('LOAD_ORDER', dirname(MANIFEST).'/stub-load-order.php');
+
+define('GENERATED_MARK', 'do not edit, rerun `make stubs:update`.');
+define('DEFAULT_EXCLUDES', ['build', 'dist', 'node_modules', 'test', 'Test', 'tests', 'Tests', 'vendor', 'vendors']);
+
+// phpstan's phar declares these functions, so a stub can't declare them again.
+// SureCart bundles getallheaders() from ralouphie/getallheaders inside a function_exists()
+// guard, and the generator strips the guard.
+define('PRUNE_FUNCTIONS', ['getallheaders']);
+
+// Installed in a plugin, the autoloader is three folders up. In this repository it's in vendor/ beside bin/.
+$autoloaders = array_filter([__DIR__.'/../../../autoload.php', __DIR__.'/../vendor/autoload.php'], 'is_file');
+if (empty($autoloaders)) {
+    fwrite(STDERR, "No Composer autoloader found — run: make test:install\n");
+    exit(1);
+}
+define('VENDOR_DIR', dirname((string) realpath((string) reset($autoloaders))));
+require VENDOR_DIR.'/autoload.php';
+if (!class_exists(StubsGenerator::class)) {
+    fwrite(STDERR, "php-stubs/generator is not installed — run: make test:install\n");
+    exit(1);
+}
+
+$list = in_array('--list', $args, true);
+$requested = array_values(array_filter($args, fn ($arg) => !str_starts_with($arg, '--')));
+
+if (!is_file(MANIFEST)) {
+    fwrite(STDERR, "error: no manifest at ".MANIFEST."\n");
+    exit(1);
+}
+$manifest = require MANIFEST;
+foreach ($requested as $slug) {
+    if (!isset($manifest[$slug])) {
+        fwrite(STDERR, "error: [{$slug}] is not in the manifest ".MANIFEST."\n");
+        exit(1);
+    }
+}
+
+/**
+ * @return string[] every source spec of an entry
+ */
+function sourcesOf(array $entry): array
+{
+    return (array) ($entry['source'] ?? []);
+}
+
+/**
+ * @return string 'url'|'github'|'zip'|'dir'
+ */
+function sourceType(string $source): string
+{
+    if (preg_match('{^https?://}', $source)) {
+        return 'url';
+    }
+    if (str_starts_with($source, 'github:')) {
+        return 'github';
+    }
+    if (str_ends_with($source, '.zip')) {
+        return 'zip';
+    }
+    return 'dir';
+}
+
+function httpGet(string $url): string|false
+{
+    $context = stream_context_create([
+        'http' => [
+            'follow_location' => 1,
+            'timeout' => 120,
+            'user_agent' => 'wp-plugin-tooling-stub-generator',
+        ],
+    ]);
+    return @file_get_contents($url, false, $context);
+}
+
+/**
+ * @return string|false the extracted source root
+ */
+function extractZip(string $zipfile, string $dest): string|false
+{
+    $zip = new ZipArchive();
+    if (true !== $zip->open($zipfile)) {
+        return false;
+    }
+    if (!$zip->extractTo($dest)) {
+        $zip->close();
+        return false;
+    }
+    $zip->close();
+    // wordpress.org and GitHub zips wrap everything in one top-level folder.
+    // A zip made in the macOS Finder adds a __MACOSX folder beside it, and its ._*.php files aren't PHP.
+    $entries = array_values(array_filter(
+        array_diff(scandir($dest), ['.', '..', '__MACOSX']),
+        fn ($entry) => !str_starts_with($entry, '.')
+    ));
+    if (1 === count($entries) && is_dir("{$dest}/{$entries[0]}")) {
+        return "{$dest}/{$entries[0]}";
+    }
+    return $dest;
+}
+
+/**
+ * Return the Version header of a plugin's main file or a theme's style.css.
+ */
+function detectVersion(string $dir): string
+{
+    $candidates = array_merge(glob("{$dir}/*.php") ?: [], glob("{$dir}/style.css") ?: []);
+    foreach ($candidates as $file) {
+        $contents = (string) file_get_contents($file, false, null, 0, 8192);
+        if (preg_match('/^(?:[ \t\/*#@]*)Version:\s*(\S+)/mi', $contents, $match)) {
+            return $match[1];
+        }
+    }
+    return 'unknown version';
+}
+
+/**
+ * Resolve a source to its folder and label, or to a skip or error message.
+ *
+ * @return array{dir: string, label: string}|string
+ */
+function resolveSource(string $source, string $slug, string $workdir, int $index): array|string
+{
+    $type = sourceType($source);
+    if ('dir' === $type) {
+        $dir = PROJECT_ROOT.'/'.$source;
+        if (!is_dir($dir)) {
+            return "error: source directory not found: {$source}";
+        }
+        return ['dir' => $dir, 'label' => $source];
+    }
+    if ('zip' === $type && !preg_match('{^https?://}', $source)) {
+        $zipfile = PROJECT_ROOT.'/'.$source;
+        if (!is_file($zipfile)) {
+            return "skip: local zip not found: {$source}";
+        }
+        $dir = extractZip($zipfile, "{$workdir}/{$slug}-{$index}");
+        return $dir ? ['dir' => $dir, 'label' => $source] : "error: could not unzip {$source}";
+    }
+    if ('github' === $type) {
+        $repo = substr($source, strlen('github:'));
+        $release = httpGet("https://api.github.com/repos/{$repo}/releases/latest");
+        $tag = $release ? (json_decode($release, true)['tag_name'] ?? '') : '';
+        if ('' === $tag) {
+            return "error: could not resolve the latest release of {$repo}";
+        }
+        $source = "https://codeload.github.com/{$repo}/zip/refs/tags/{$tag}";
+    }
+    echo "  downloading {$source}\n";
+    $data = httpGet($source);
+    if (false === $data) {
+        return "error: download failed: {$source}";
+    }
+    $zipfile = "{$workdir}/{$slug}-{$index}.zip";
+    file_put_contents($zipfile, $data);
+    $dir = extractZip($zipfile, "{$workdir}/{$slug}-{$index}");
+    return $dir ? ['dir' => $dir, 'label' => $source] : "error: could not unzip {$source}";
+}
+
+/**
+ * Return the classes, functions and constants a PHP file declares at the top level.
+ *
+ * @return string[] e.g. ['class:foo\bar', 'function:baz', 'constant:QUX']
+ */
+function declaredSymbols(string $file): array
+{
+    $tokens = token_get_all((string) file_get_contents($file));
+    $ns = '';
+    $depth = 0;
+    $topDepth = 0; // 1 while inside a braced namespace block, else 0
+    $symbols = [];
+    $total = count($tokens);
+    for ($i = 0; $i < $total; ++$i) {
+        $token = $tokens[$i];
+        if (is_string($token)) {
+            $depth += ('{' === $token) ? 1 : (('}' === $token) ? -1 : 0);
+            continue;
+        }
+        [$id, $text] = $token;
+        if (in_array($id, [T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES], true)) {
+            ++$depth;
+            continue;
+        }
+        $nextMeaningful = function (int $from) use ($tokens, $total): array {
+            for ($j = $from; $j < $total; ++$j) {
+                if (is_string($tokens[$j])) {
+                    return [$tokens[$j], null, $j];
+                }
+                if (T_WHITESPACE !== $tokens[$j][0] && T_COMMENT !== $tokens[$j][0] && T_DOC_COMMENT !== $tokens[$j][0]) {
+                    return [$tokens[$j][1], $tokens[$j][0], $j];
+                }
+            }
+            return ['', null, $total];
+        };
+        if (T_NAMESPACE === $id) {
+            [$name, $type, $at] = $nextMeaningful($i + 1);
+            $ns = (null !== $type && in_array($type, [T_STRING, T_NAME_QUALIFIED], true)) ? $name : '';
+            // A braced namespace puts the top level one brace deeper, and `namespace X;` doesn't.
+            [$next] = ('' === $ns) ? [$name] : $nextMeaningful($at + 1);
+            $topDepth = ('{' === $next) ? 1 : 0;
+            continue;
+        }
+        if ($depth > $topDepth) {
+            continue; // inside a class body or another block
+        }
+        if (in_array($id, [T_CLASS, T_INTERFACE, T_TRAIT, T_ENUM], true)) {
+            [$name, $type] = $nextMeaningful($i + 1);
+            if (T_STRING === $type) { // skips ::class and anonymous classes
+                $symbols[] = 'class:'.strtolower(($ns ? $ns.'\\' : '').$name);
+            }
+        } elseif (T_FUNCTION === $id) {
+            [$name, $type] = $nextMeaningful($i + 1);
+            if ('&' === $name) {
+                [$name, $type] = $nextMeaningful($i + 2);
+            }
+            if (T_STRING === $type) {
+                $symbols[] = 'function:'.strtolower(($ns ? $ns.'\\' : '').$name);
+            }
+        } elseif (in_array($id, [T_STRING, T_NAME_FULLY_QUALIFIED], true)
+            && in_array(strtolower($text), ['define', '\define'], true)) {
+            [$name] = $nextMeaningful($i + 1);
+            if ('(' === $name) {
+                [$name, $type] = $nextMeaningful($i + 2);
+                if (T_CONSTANT_ENCAPSED_STRING === $type) {
+                    $symbols[] = 'constant:'.trim($name, '"\'');
+                }
+            }
+        }
+    }
+    return array_unique($symbols);
+}
+
+/**
+ * Return the parents, interfaces and traits a stub file uses that it doesn't declare.
+ *
+ * @return string[] fully qualified names in lower case
+ */
+function externalDependencies(string $file): array
+{
+    static $parser = null;
+    if (null === $parser) {
+        $parser = (new PhpParser\ParserFactory())->createForNewestSupportedVersion();
+    }
+    $stmts = $parser->parse((string) file_get_contents($file));
+    $traverser = new PhpParser\NodeTraverser();
+    $traverser->addVisitor(new PhpParser\NodeVisitor\NameResolver());
+    $stmts = $traverser->traverse($stmts ?? []);
+    $own = [];
+    $needs = [];
+    foreach ((new PhpParser\NodeFinder())->findInstanceOf($stmts, Stmt\ClassLike::class) as $node) {
+        if ($node->namespacedName) {
+            $own[strtolower($node->namespacedName->toString())] = true;
+        }
+        $names = [];
+        if ($node instanceof Stmt\Class_) {
+            $names = array_merge($node->extends ? [$node->extends] : [], $node->implements);
+        } elseif ($node instanceof Stmt\Interface_) {
+            $names = $node->extends;
+        } elseif ($node instanceof Stmt\Enum_) {
+            $names = $node->implements;
+        }
+        foreach ($node->stmts as $stmt) {
+            if ($stmt instanceof Stmt\TraitUse) {
+                $names = array_merge($names, $stmt->traits);
+            }
+        }
+        foreach ($names as $name) {
+            $needs[strtolower(ltrim($name->toString(), '\\'))] = true;
+        }
+    }
+    return array_keys(array_diff_key($needs, $own));
+}
+
+/**
+ * Group the statements by namespace and put the ones outside a namespace in a last group named ''.
+ *
+ * @param Node[] $stmts
+ * @return array<int, array{0: string, 1: Stmt[]}>
+ */
+function groupByNamespace(array $stmts): array
+{
+    $groups = [];
+    $global = [];
+    foreach ($stmts as $stmt) {
+        if ($stmt instanceof Stmt\Namespace_) {
+            $groups[] = [$stmt->name ? $stmt->name->toString() : '', $stmt->stmts];
+        } elseif ($stmt instanceof Stmt) {
+            $global[] = $stmt;
+        }
+    }
+    if ($global) {
+        $groups[] = ['', $global];
+    }
+    return $groups;
+}
+
+/**
+ * Remove every class that extends WP_CLI_Command, directly or through a parent.
+ *
+ * @param Node[] $stmts
+ * @return Stmt\Namespace_[]
+ */
+function pruneWpCliCommands(array $stmts): array
+{
+    // WP_CLI_Command isn't declared when the stubs load, so a class that extends it is a fatal error.
+    // A suite runs without WP-CLI and phpstan only scans the wp-cli stubs.
+    $groups = groupByNamespace($stmts);
+    $parents = []; // lower-case class name => lower-case parent name
+    foreach ($groups as [$ns, $nsStmts]) {
+        foreach ($nsStmts as $stmt) {
+            if ($stmt instanceof Stmt\Class_ && $stmt->name && $stmt->extends) {
+                $fqn = strtolower(($ns ? $ns.'\\' : '').$stmt->name->name);
+                $parents[$fqn] = strtolower(ltrim($stmt->extends->toString(), '\\'));
+            }
+        }
+    }
+    $doomed = function (string $fqn) use ($parents): bool {
+        $seen = [];
+        while (isset($parents[$fqn]) && !isset($seen[$fqn])) {
+            $seen[$fqn] = true;
+            $fqn = $parents[$fqn];
+        }
+        return 'wp_cli_command' === $fqn;
+    };
+    $pruned = [];
+    foreach ($groups as [$ns, $nsStmts]) {
+        $kept = array_values(array_filter($nsStmts, function (Stmt $stmt) use ($ns, $doomed) {
+            if ($stmt instanceof Stmt\Class_ && $stmt->name) {
+                return !$doomed(strtolower(($ns ? $ns.'\\' : '').$stmt->name->name));
+            }
+            return true;
+        }));
+        if ($kept) {
+            $pruned[] = new Stmt\Namespace_($ns ? new Name($ns) : null, $kept);
+        }
+    }
+    return $pruned;
+}
+
+/**
+ * Remove every class, function and constant that WordPress declares.
+ *
+ * @param Node[] $stmts
+ * @return Stmt\Namespace_[]
+ */
+function pruneWordPressSymbols(array $stmts): array
+{
+    // A plugin can override a pluggable function such as wp_mail() inside a function_exists() guard.
+    // The generator strips the guard, and a stub that declares wp_mail() is a fatal redeclaration.
+    static $wordpress = null;
+    if (null === $wordpress) {
+        $wordpress = array_flip(declaredSymbols(VENDOR_DIR.'/php-stubs/wordpress-stubs/wordpress-stubs.php'));
+        foreach (PRUNE_FUNCTIONS as $function) {
+            $wordpress['function:'.strtolower($function)] = true;
+        }
+    }
+    $pruned = [];
+    foreach (groupByNamespace($stmts) as [$ns, $nsStmts]) {
+        $kept = array_values(array_filter($nsStmts, function (Stmt $stmt) use ($ns, $wordpress) {
+            $prefix = $ns ? strtolower($ns).'\\' : '';
+            if ($stmt instanceof Stmt\ClassLike && $stmt->name) {
+                return !isset($wordpress['class:'.$prefix.strtolower($stmt->name->name)]);
+            }
+            if ($stmt instanceof Stmt\Function_) {
+                return !isset($wordpress['function:'.$prefix.strtolower($stmt->name->name)]);
+            }
+            if (null !== ($constant = definedConstantName($stmt))) {
+                return !isset($wordpress['constant:'.$constant]);
+            }
+            return true;
+        }));
+        if ($kept) {
+            $pruned[] = new Stmt\Namespace_($ns ? new Name($ns) : null, $kept);
+        }
+    }
+    return $pruned;
+}
+
+/**
+ * Move the define() calls to the top of the file, each after the constants it reads.
+ *
+ * @param Node[] $stmts
+ * @return Stmt\Namespace_[]
+ */
+function sortDefines(array $stmts): array
+{
+    // php-stubs/generator writes the global defines after the namespaced ones.
+    // ProfilePress has a namespaced define() that reads a global constant, so it would run too early.
+    $groups = groupByNamespace($stmts);
+    $defines = []; // name => value expression
+    $functions = []; // lower-case function name without its namespace => true
+    foreach ($groups as [, $nsStmts]) {
+        foreach ($nsStmts as $stmt) {
+            if (null !== ($constant = definedConstantName($stmt))) {
+                $defines[$constant] = $stmt;
+            } elseif ($stmt instanceof Stmt\Function_) {
+                $functions[strtolower($stmt->name->name)] = true;
+            }
+        }
+    }
+    if (!$defines) {
+        return array_map(fn ($group) => new Stmt\Namespace_($group[0] ? new Name($group[0]) : null, $group[1]), $groups);
+    }
+    $finder = new PhpParser\NodeFinder();
+    $dependencies = [];
+    $deferred = [];
+    foreach ($defines as $constant => $stmt) {
+        $value = $stmt->expr->args[1]->value ?? null;
+        $dependencies[$constant] = [];
+        if (!$value instanceof Node) {
+            continue;
+        }
+        foreach ($finder->findInstanceOf([$value], PhpParser\Node\Expr\ConstFetch::class) as $fetch) {
+            $name = $fetch->name->getLast();
+            if (isset($defines[$name])) {
+                $dependencies[$constant][] = $name;
+            }
+        }
+        foreach ($finder->findInstanceOf([$value], FuncCall::class) as $call) {
+            if ($call->name instanceof Name && isset($functions[strtolower($call->name->getLast())])) {
+                $deferred[$constant] = true;
+            }
+        }
+    }
+    // A define depending on a deferred define is deferred too.
+    do {
+        $changed = false;
+        foreach ($dependencies as $constant => $needs) {
+            if (!isset($deferred[$constant]) && array_intersect_key(array_flip($needs), $deferred)) {
+                $deferred[$constant] = true;
+                $changed = true;
+            }
+        }
+    } while ($changed);
+    // Put each define after the defines it reads and keep the input order otherwise.
+    $sorted = [];
+    $visiting = [];
+    $visit = function (string $constant) use (&$visit, &$sorted, &$visiting, $dependencies) {
+        if (isset($sorted[$constant]) || isset($visiting[$constant])) {
+            return; // already sorted, or a cycle
+        }
+        $visiting[$constant] = true;
+        foreach ($dependencies[$constant] as $need) {
+            $visit($need);
+        }
+        unset($visiting[$constant]);
+        $sorted[$constant] = true;
+    };
+    foreach (array_keys($defines) as $constant) {
+        $visit($constant);
+    }
+    $order = array_keys($sorted);
+    $head = [];
+    $tail = [];
+    foreach ($order as $constant) {
+        if (isset($deferred[$constant])) {
+            $tail[] = $defines[$constant];
+        } else {
+            $head[] = $defines[$constant];
+        }
+    }
+    $result = [];
+    // define() declares a global constant from any namespace, so the defines can move out of theirs.
+    if ($head) {
+        $result[] = new Stmt\Namespace_(null, $head);
+    }
+    foreach ($groups as [$ns, $nsStmts]) {
+        $kept = array_values(array_filter($nsStmts, fn ($stmt) => null === definedConstantName($stmt)));
+        if ($kept) {
+            $result[] = new Stmt\Namespace_($ns ? new Name($ns) : null, $kept);
+        }
+    }
+    if ($tail) {
+        $result[] = new Stmt\Namespace_(null, $tail);
+    }
+    return $result;
+}
+
+/**
+ * Remove every class, interface and trait that extends, implements or uses a name that isn't
+ * declared when the stub loads.
+ *
+ * @param Node[] $stmts
+ * @return Stmt\Namespace_[]
+ */
+function pruneDanglingClassLikes(array $stmts, string $slug): array
+{
+    // SureCart ships an AffiliateWP integration that extends a class only AffiliateWP declares.
+    // SureCart loads it only when AffiliateWP is active, but a stub always loads.
+    static $wordpress = null;
+    if (null === $wordpress) {
+        $wordpress = array_flip(declaredSymbols(VENDOR_DIR.'/php-stubs/wordpress-stubs/wordpress-stubs.php'));
+    }
+    $external = null; // not static: an earlier entry in this run can rewrite another stub
+    $otherStubs = array_filter(
+        glob(STUBS_DIR.'/*.php') ?: [],
+        fn ($file) => basename($file) !== "{$slug}.php"
+    );
+    $groups = groupByNamespace($stmts);
+    $own = [];
+    foreach ($groups as [$ns, $nsStmts]) {
+        foreach ($nsStmts as $stmt) {
+            if ($stmt instanceof Stmt\ClassLike && $stmt->name) {
+                $own[strtolower(($ns ? $ns.'\\' : '').$stmt->name->name)] = true;
+            }
+        }
+    }
+    $resolvable = function (string $dependency) use ($wordpress, &$external, $otherStubs, &$own): bool {
+        if (isset($own[$dependency]) || isset($wordpress['class:'.$dependency])) {
+            return true;
+        }
+        if (class_exists($dependency, false) || interface_exists($dependency, false) || trait_exists($dependency, false)) {
+            return true;
+        }
+        if (null === $external) {
+            $external = [];
+            foreach ($otherStubs as $file) {
+                $external += array_flip(declaredSymbols($file));
+            }
+        }
+        return isset($external['class:'.$dependency]);
+    };
+    $dependenciesOf = function (Stmt\ClassLike $node): array {
+        $names = [];
+        if ($node instanceof Stmt\Class_) {
+            if ($node->extends) {
+                $names[] = $node->extends;
+            }
+            $names = array_merge($names, $node->implements);
+        } elseif ($node instanceof Stmt\Interface_) {
+            $names = $node->extends;
+        }
+        foreach ($node->stmts as $stmt) {
+            if ($stmt instanceof Stmt\TraitUse) {
+                $names = array_merge($names, $stmt->traits);
+            }
+        }
+        return array_map(fn (Name $name) => strtolower(ltrim($name->toString(), '\\')), $names);
+    };
+    // a removal can strand a class that extends it, so repeat until nothing changes
+    do {
+        $changed = false;
+        foreach ($groups as $g => [$ns, $nsStmts]) {
+            foreach ($nsStmts as $s => $stmt) {
+                if (!$stmt instanceof Stmt\ClassLike || !$stmt->name) {
+                    continue;
+                }
+                foreach ($dependenciesOf($stmt) as $dependency) {
+                    if (!$resolvable($dependency)) {
+                        $fqn = strtolower(($ns ? $ns.'\\' : '').$stmt->name->name);
+                        unset($own[$fqn], $groups[$g][1][$s]);
+                        $changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    } while ($changed);
+    $pruned = [];
+    foreach ($groups as [$ns, $nsStmts]) {
+        if ($nsStmts) {
+            $pruned[] = new Stmt\Namespace_($ns ? new Name($ns) : null, array_values($nsStmts));
+        }
+    }
+    return $pruned;
+}
+
+/**
+ * Add #[\ReturnTypeWillChange] to every untyped method that a PHP interface gives a tentative
+ * return type, such as ArrayAccess::offsetGet().
+ *
+ * @param Node[] $stmts
+ * @return Stmt\Namespace_[]
+ */
+function addReturnTypeWillChange(array $stmts): array
+{
+    // PHP 8.1 raises a deprecation when it declares a class with such a method and no attribute.
+    // The suite declares every stub class each time it boots.
+    $tentative = [ // lower-case method name => the PHP interface that declares it
+        'count' => 'Countable',
+        'current' => 'Iterator',
+        'getiterator' => 'IteratorAggregate',
+        'jsonserialize' => 'JsonSerializable',
+        'key' => 'Iterator',
+        'next' => 'Iterator',
+        'offsetexists' => 'ArrayAccess',
+        'offsetget' => 'ArrayAccess',
+        'offsetset' => 'ArrayAccess',
+        'offsetunset' => 'ArrayAccess',
+        'rewind' => 'Iterator',
+        'seek' => 'SeekableIterator',
+        'valid' => 'Iterator',
+    ];
+    $groups = groupByNamespace($stmts);
+    $edges = []; // lower-case class name => the lower-case names it extends or implements
+    foreach ($groups as [$ns, $nsStmts]) {
+        foreach ($nsStmts as $stmt) {
+            if (!$stmt instanceof Stmt\ClassLike || !$stmt->name) {
+                continue;
+            }
+            $names = [];
+            if ($stmt instanceof Stmt\Class_) {
+                $names = array_merge($stmt->extends ? [$stmt->extends] : [], $stmt->implements);
+            } elseif ($stmt instanceof Stmt\Interface_) {
+                $names = $stmt->extends;
+            } elseif ($stmt instanceof Stmt\Enum_) {
+                $names = $stmt->implements;
+            }
+            $edges[strtolower(($ns ? $ns.'\\' : '').$stmt->name->name)] =
+                array_map(fn (Name $name) => strtolower(ltrim($name->toString(), '\\')), $names);
+        }
+    }
+    $memo = [];
+    $reaches = function (string $name, string $interface) use (&$reaches, &$memo, $edges): bool {
+        $key = "{$name}>{$interface}";
+        if (isset($memo[$key])) {
+            return $memo[$key];
+        }
+        $memo[$key] = false; // set first so a cycle answers false
+        if ($name === strtolower($interface)) {
+            return $memo[$key] = true;
+        }
+        if (!isset($edges[$name])) {
+            // Outside this stub only a class PHP has loaded can be checked, such as ArrayAccess.
+            // A parent from another stub isn't followed, and that stub adds the attribute
+            // to the parent's methods.
+            return $memo[$key] = (class_exists($name, false) || interface_exists($name, false))
+                && is_a($name, $interface, true);
+        }
+        foreach ($edges[$name] as $ancestor) {
+            if ($reaches($ancestor, $interface)) {
+                return $memo[$key] = true;
+            }
+        }
+        return false;
+    };
+    foreach ($groups as [$ns, $nsStmts]) {
+        foreach ($nsStmts as $stmt) {
+            if (!$stmt instanceof Stmt\ClassLike || !$stmt->name) {
+                continue;
+            }
+            $fqn = strtolower(($ns ? $ns.'\\' : '').$stmt->name->name);
+            foreach ($stmt->getMethods() as $method) {
+                $name = $method->name->toLowerString();
+                if (null !== $method->returnType || !isset($tentative[$name])) {
+                    continue;
+                }
+                foreach ($method->attrGroups as $attrGroup) {
+                    foreach ($attrGroup->attrs as $attr) {
+                        if ('returntypewillchange' === strtolower(ltrim($attr->name->toString(), '\\'))) {
+                            continue 3; // upstream already ships it
+                        }
+                    }
+                }
+                if ($reaches($fqn, $tentative[$name])) {
+                    $method->attrGroups[] = new Node\AttributeGroup([
+                        new Node\Attribute(new Name\FullyQualified('ReturnTypeWillChange')),
+                    ]);
+                }
+            }
+        }
+    }
+    return array_map(fn ($group) => new Stmt\Namespace_($group[0] ? new Name($group[0]) : null, $group[1]), $groups);
+}
+
+function definedConstantName(Stmt $stmt): ?string
+{
+    if ($stmt instanceof Stmt\Expression
+        && $stmt->expr instanceof FuncCall
+        && $stmt->expr->name instanceof Name
+        && 'define' === strtolower(ltrim($stmt->expr->name->toString(), '\\'))
+        && isset($stmt->expr->args[0])
+        && $stmt->expr->args[0] instanceof Node\Arg
+        && $stmt->expr->args[0]->value instanceof String_) {
+        return $stmt->expr->args[0]->value->value;
+    }
+    return null;
+}
+
+/**
+ * Keep the allowlisted symbols and every parent, interface and trait a kept class needs.
+ *
+ * @param Node[] $stmts
+ * @param string[] $allowlist
+ * @return array{stmts: Stmt\Namespace_[], missing: string[]}
+ */
+function filterSymbols(array $stmts, array $allowlist): array
+{
+    $allow = [];
+    foreach ($allowlist as $symbol) {
+        $allow[strtolower(ltrim($symbol, '\\'))] = $symbol;
+    }
+    $groups = groupByNamespace($stmts);
+
+    $classLikes = []; // lower-case name => [group index, statement index]
+    foreach ($groups as $g => [$ns, $nsStmts]) {
+        foreach ($nsStmts as $s => $stmt) {
+            if ($stmt instanceof Stmt\ClassLike && $stmt->name) {
+                $classLikes[strtolower(($ns ? $ns.'\\' : '').$stmt->name->name)] = [$g, $s];
+            }
+        }
+    }
+
+    $dependenciesOf = function (Stmt\ClassLike $node): array {
+        $names = [];
+        if ($node instanceof Stmt\Class_) {
+            if ($node->extends) {
+                $names[] = $node->extends;
+            }
+            $names = array_merge($names, $node->implements);
+        } elseif ($node instanceof Stmt\Interface_) {
+            $names = $node->extends;
+        }
+        if ($node instanceof Stmt\Class_ || $node instanceof Stmt\Trait_ || $node instanceof Stmt\Enum_) {
+            foreach ($node->stmts as $stmt) {
+                if ($stmt instanceof Stmt\TraitUse) {
+                    $names = array_merge($names, $stmt->traits);
+                }
+            }
+        }
+        return array_map(fn (Name $name) => strtolower(ltrim($name->toString(), '\\')), $names);
+    };
+
+    $matched = []; // allowlist keys that were found
+    $keep = []; // "group index:statement index" => true
+    $queue = [];
+    foreach ($groups as $g => [$ns, $nsStmts]) {
+        foreach ($nsStmts as $s => $stmt) {
+            $fqn = null;
+            if (($stmt instanceof Stmt\ClassLike || $stmt instanceof Stmt\Function_) && $stmt->name) {
+                $fqn = ($ns ? $ns.'\\' : '').$stmt->name->name;
+            } elseif (null !== ($constant = definedConstantName($stmt))) {
+                $fqn = $constant;
+            } elseif ($stmt instanceof Stmt\Const_) {
+                foreach ($stmt->consts as $const) {
+                    $fqn = ($ns ? $ns.'\\' : '').$const->name->name;
+                    break;
+                }
+            }
+            if (null !== $fqn && isset($allow[strtolower($fqn)])) {
+                $matched[strtolower($fqn)] = true;
+                $keep["{$g}:{$s}"] = true;
+                if ($stmt instanceof Stmt\ClassLike) {
+                    $queue[] = [$g, $s];
+                }
+            }
+        }
+    }
+    while ($queue) {
+        [$g, $s] = array_pop($queue);
+        $node = $groups[$g][1][$s];
+        foreach ($dependenciesOf($node) as $dependency) {
+            if (isset($classLikes[$dependency])) {
+                [$dg, $ds] = $classLikes[$dependency];
+                if (!isset($keep["{$dg}:{$ds}"])) {
+                    $keep["{$dg}:{$ds}"] = true;
+                    $queue[] = [$dg, $ds];
+                }
+            }
+        }
+    }
+
+    $filtered = [];
+    foreach ($groups as $g => [$ns, $nsStmts]) {
+        $kept = [];
+        foreach ($nsStmts as $s => $stmt) {
+            if (isset($keep["{$g}:{$s}"])) {
+                $kept[] = $stmt;
+            }
+        }
+        if ($kept) {
+            $filtered[] = new Stmt\Namespace_($ns ? new Name($ns) : null, $kept);
+        }
+    }
+    $missing = [];
+    foreach ($allow as $key => $original) {
+        if (!isset($matched[$key])) {
+            $missing[] = $original;
+        }
+    }
+    return ['stmts' => $filtered, 'missing' => $missing];
+}
+
+// ---------------------------------------------------------------------------
+
+if ($list) {
+    foreach ($manifest as $slug => $entry) {
+        $notes = [];
+        foreach (sourcesOf($entry) as $source) {
+            $type = sourceType($source);
+            if ('zip' === $type && !is_file(PROJECT_ROOT.'/'.$source)) {
+                $notes[] = "{$source} (MISSING — entry is skipped)";
+            } else {
+                $notes[] = $source;
+            }
+        }
+        $mode = isset($entry['symbols']) ? sprintf('%d symbols', count($entry['symbols'])) : 'everything';
+        printf("%-20s %-10s %s\n", $slug, $mode, implode(' + ', $notes));
+    }
+    exit(0);
+}
+
+$workdir = sys_get_temp_dir().'/wp-plugin-tooling-stubs-'.getmypid();
+mkdir($workdir, 0777, true);
+register_shutdown_function(function () use ($workdir) {
+    exec('rm -rf '.escapeshellarg($workdir));
+});
+
+$slugs = $requested ?: array_keys($manifest);
+$failures = [];
+$skipped = [];
+$written = [];
+
+foreach ($slugs as $slug) {
+    $entry = $manifest[$slug];
+    echo "[{$slug}]\n";
+    $dirs = [];
+    $headerSources = [];
+    $skip = false;
+    foreach (array_values(sourcesOf($entry)) as $index => $source) {
+        $resolved = resolveSource($source, $slug, $workdir, $index);
+        if (is_string($resolved)) {
+            if (str_starts_with($resolved, 'skip:') && !in_array($slug, $requested, true)) {
+                echo '  '.substr($resolved, 6)." — skipped\n";
+                $skipped[] = $slug;
+            } else {
+                fwrite(STDERR, "  ".preg_replace('/^(skip|error): /', '', $resolved)."\n");
+                $failures[] = $slug;
+            }
+            $skip = true;
+            break;
+        }
+        $dirs[] = $resolved['dir'];
+        $headerSources[] = ['label' => $resolved['label'], 'version' => detectVersion($resolved['dir'])];
+    }
+    if ($skip) {
+        continue;
+    }
+    if (!$dirs) {
+        fwrite(STDERR, "  no source configured\n");
+        $failures[] = $slug;
+        continue;
+    }
+
+    $excludes = $entry['exclude'] ?? DEFAULT_EXCLUDES;
+    $excludedFiles = array_filter($excludes, fn ($exclude) => str_ends_with($exclude, '.php'));
+    $finder = new Finder();
+    $finder->in($dirs)->exclude(array_diff($excludes, $excludedFiles))->sortByName();
+    foreach ($excludedFiles as $file) {
+        $finder->notPath('{^'.preg_quote($file, '{}').'$}');
+    }
+    $generator = new StubsGenerator(
+        StubsGenerator::FUNCTIONS
+        | StubsGenerator::CLASSES
+        | StubsGenerator::INTERFACES
+        | StubsGenerator::TRAITS
+        | StubsGenerator::ENUMS
+        | StubsGenerator::CONSTANTS,
+        // Without it php-stubs/generator drops the protected members of a final class.
+        // A final class in the Twig that Elementor bundles then leaves an abstract method
+        // unimplemented, which is a fatal error when the stub loads.
+        ['include_inaccessible_class_nodes' => true]
+    );
+    $result = $generator->generate($finder);
+    $stmts = pruneWordPressSymbols(pruneWpCliCommands($result->getStubStmts()));
+    $stmts = pruneDanglingClassLikes($stmts, $slug);
+    $stmts = addReturnTypeWillChange($stmts);
+
+    if (isset($entry['symbols'])) {
+        ['stmts' => $stmts, 'missing' => $missing] = filterSymbols($stmts, $entry['symbols']);
+        foreach ($missing as $symbol) {
+            fwrite(STDERR, "  warning: symbol not found in source: {$symbol}\n");
+        }
+    }
+    $stmts = sortDefines($stmts);
+    if (!$stmts) {
+        fwrite(STDERR, "  produced no symbols — refusing to write an empty stub\n");
+        $failures[] = $slug;
+        continue;
+    }
+
+    $versions = implode(' + ', array_column($headerSources, 'version'));
+    $header = "/**\n * {$slug} {$versions}\n"
+        ." * Generated by pryley/wp-plugin-tooling's generate-stubs — ".GENERATED_MARK."\n"
+        .implode('', array_map(
+            fn ($source) => " * Source: {$source['label']}".(count($headerSources) > 1 ? " ({$source['version']})" : '')."\n",
+            $headerSources
+        ))
+        .' */';
+    $code = (new Standard())->prettyPrintFile($stmts);
+    $code = preg_replace('/^<\?php/', "<?php\n\n{$header}", $code, 1)."\n";
+    if (isset($entry['append'])) {
+        $fragment = PROJECT_ROOT.'/'.$entry['append'];
+        if (!is_file($fragment)) {
+            fwrite(STDERR, "  append fragment not found: {$entry['append']}\n");
+            $failures[] = $slug;
+            continue;
+        }
+        $code .= preg_replace('/^<\?php\s*/', '', (string) file_get_contents($fragment));
+    }
+
+    $outfile = STUBS_DIR."/{$slug}.php";
+    if (is_file($outfile) && !str_contains((string) file_get_contents($outfile, false, null, 0, 2048), GENERATED_MARK)) {
+        fwrite(STDERR, '  '.str_replace(PROJECT_ROOT.'/', '', $outfile)." is hand-written; the generator will not overwrite it\n");
+        $failures[] = $slug;
+        continue;
+    }
+    $changed = !is_file($outfile) || md5_file($outfile) !== md5($code);
+    if ((!is_dir(STUBS_DIR) && !mkdir(STUBS_DIR, 0777, true)) || false === file_put_contents($outfile, $code)) {
+        fwrite(STDERR, "  could not write {$outfile}\n");
+        $failures[] = $slug;
+        continue;
+    }
+    $written[] = $slug;
+    printf("  wrote %s (%s lines, %s)\n", str_replace(PROJECT_ROOT.'/', '', $outfile), number_format(substr_count($code, "\n")), $changed ? 'CHANGED' : 'unchanged');
+}
+
+// A suite and phpstan load the stubs together, so a symbol in two stubs is a fatal redeclaration.
+$declarations = [];
+foreach (glob(STUBS_DIR.'/*.php') as $file) {
+    foreach (declaredSymbols($file) as $symbol) {
+        $declarations[$symbol][] = basename($file);
+    }
+}
+$duplicates = array_filter($declarations, fn ($files) => count($files) > 1);
+if ($duplicates) {
+    fwrite(STDERR, "\nwarning: symbols declared in more than one stub (fatal when loaded together):\n");
+    foreach ($duplicates as $symbol => $files) {
+        fwrite(STDERR, "  {$symbol}  in  ".implode(', ', $files)."\n");
+    }
+}
+
+// A stub that extends a class from another stub needs stub-load-order.php to load that stub first.
+// Without that the suite fails only where the files are read in the wrong order,
+// which can be in CI and not on a laptop.
+$loadOrder = is_file(LOAD_ORDER) ? require LOAD_ORDER : [];
+$unmapped = [];
+foreach (glob(STUBS_DIR.'/*.php') as $file) {
+    $stub = basename($file);
+    $mapped = $loadOrder[$stub] ?? [];
+    foreach (externalDependencies($file) as $dependency) {
+        $parent = $declarations['class:'.$dependency][0] ?? null;
+        if (null !== $parent && $parent !== $stub && !in_array($parent, $mapped, true)) {
+            $unmapped[$stub][$parent][] = $dependency;
+        }
+    }
+}
+if ($unmapped) {
+    fwrite(STDERR, "\nerror: a stub extends symbols from another stub that is not listed as its\n"
+        ."prerequisite — add these to ".str_replace(PROJECT_ROOT.'/', '', LOAD_ORDER).":\n");
+    foreach ($unmapped as $stub => $parents) {
+        foreach ($parents as $parent => $names) {
+            fwrite(STDERR, sprintf("  '%s' => ['%s'],  // %s%s\n", $stub, $parent, $names[0],
+                count($names) > 1 ? sprintf(' and %d others', count($names) - 1) : ''));
+        }
+    }
+}
+
+printf(
+    "\ndone: %d written, %d skipped, %d failed\n",
+    count($written),
+    count($skipped),
+    count($failures)
+);
+if ($skipped) {
+    echo 'skipped (local zip absent): '.implode(', ', $skipped)."\n";
+}
+if ($written) {
+    echo "Now run phpstan and the tests: a regenerated stub can change which integrations load.\n";
+}
+exit(($failures || $unmapped) ? 1 : 0);

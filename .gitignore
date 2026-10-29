@@ -1,0 +1,5 @@
+/composer.lock
+/tools/*/composer.lock
+/tools/*/vendor
+/vendor
+.DS_Store
